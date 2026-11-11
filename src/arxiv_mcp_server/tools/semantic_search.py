@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import httpx
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -101,11 +103,13 @@ reindex_tool = types.Tool(
 def _load_dependencies() -> bool:
     """Load optional ML dependencies only when semantic functionality is used."""
     global np, SentenceTransformer
-    if np is not None and SentenceTransformer is not None:
+    if np is not None and (settings.EMBEDDING_BASE_URL or SentenceTransformer is not None):
         return True
     try:
         import numpy as numpy_module
-        from sentence_transformers import SentenceTransformer as model_class
+        model_class = None
+        if not settings.EMBEDDING_BASE_URL:
+            from sentence_transformers import SentenceTransformer as model_class
     except ImportError:
         return False
     np = numpy_module
@@ -147,6 +151,14 @@ def _connect() -> sqlite3.Connection:
             updated_at TEXT NOT NULL
         )
         """)
+    conn.execute("CREATE TABLE IF NOT EXISTS embedding_config (id INTEGER PRIMARY KEY CHECK (id = 1), generation TEXT NOT NULL)")
+    generation = hashlib.sha256((settings.EMBEDDING_GENERATION or (settings.EMBEDDING_BASE_URL.rstrip("/") + "\0" + settings.EMBEDDING_MODEL if settings.EMBEDDING_BASE_URL else EMBEDDING_MODEL_NAME)).encode()).hexdigest()
+    prior = conn.execute("SELECT generation FROM embedding_config WHERE id = 1").fetchone()
+    populated = conn.execute("SELECT 1 FROM semantic_index LIMIT 1").fetchone() is not None
+    if populated and ((prior and prior[0] != generation) or (not prior and settings.EMBEDDING_BASE_URL)):
+        conn.close()
+        raise ValueError("Embedding configuration changed. Run reindex with clear_existing=true before semantic search.")
+    conn.execute("INSERT INTO embedding_config VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET generation=excluded.generation", (generation,))
     conn.commit()
     return conn
 
@@ -162,6 +174,28 @@ def _get_model() -> Any:
 
 def _embed_text(text: str) -> Any:
     """Create embedding vector for a text payload."""
+    if settings.EMBEDDING_BASE_URL:
+        if not settings.EMBEDDING_MODEL:
+            raise ValueError("Configure EMBEDDING_MODEL for endpoint embeddings.")
+        try:
+            with httpx.Client(timeout=settings.EMBEDDING_TIMEOUT, follow_redirects=False, trust_env=False) as client:
+                response = client.post(
+                    settings.EMBEDDING_BASE_URL.rstrip("/") + "/embeddings",
+                    headers={"Authorization": "Bearer " + settings.EMBEDDING_API_KEY} if settings.EMBEDDING_API_KEY else {},
+                    json={"model": settings.EMBEDDING_MODEL, "input": [text or ""], "encoding_format": "float"},
+                )
+                response.raise_for_status()
+                data = response.json()["data"]
+                if len(data) != 1 or data[0].get("index", 0) != 0:
+                    raise ValueError("Unexpected embedding response.")
+                vector = np.asarray(data[0]["embedding"], dtype=np.float32)
+                norm = np.linalg.norm(vector)
+                if vector.ndim != 1 or not 0 < len(vector) <= 16000 or not np.isfinite(vector).all() or not np.isfinite(norm) or norm == 0:
+                    raise ValueError("Invalid embedding vector.")
+                return vector / norm
+        except Exception:
+            # Provider URLs, credentials and error bodies must not enter MCP output or logs.
+            raise ValueError("Embedding endpoint failed or returned invalid vectors.") from None
     model = _get_model()
     return model.encode(text or "", convert_to_numpy=True, normalize_embeddings=True)
 
@@ -351,9 +385,12 @@ def rebuild_index(clear_existing: bool = True) -> Dict[str, Any]:
     )
 
     if clear_existing:
-        with _connect() as conn:
-            conn.execute("DELETE FROM semantic_index")
-            conn.commit()
+        with sqlite3.connect(_db_path()) as conn:
+            # Metadata and vectors are reset together before the new generation is indexed.
+            conn.execute("DROP TABLE IF EXISTS semantic_index")
+            conn.execute("DROP TABLE IF EXISTS embedding_config")
+        with _connect():
+            pass
 
     indexed = 0
     failed: List[str] = []
