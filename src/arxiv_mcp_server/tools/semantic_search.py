@@ -55,8 +55,8 @@ semantic_search_tool = types.Tool(
         "IMPORTANT: only searches your local downloaded collection — will return empty results if no papers "
         "have been downloaded yet. Use search_papers to find papers on arXiv, then download_paper to add "
         "them to the local index before using this tool. "
-        "Requires pro dependencies: uvx --from 'arxiv-mcp-server[pro]' arxiv-mcp-server "
-        "(or uv tool install 'arxiv-mcp-server[pro]')."
+        "Searches saved abstracts, not full-paper passages. Uses a configured embedding endpoint "
+        "with [endpoint] dependencies, or a local model with [pro] dependencies."
     ),
     inputSchema={
         "type": "object",
