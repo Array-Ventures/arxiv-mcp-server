@@ -130,6 +130,19 @@ def _track_index_task(coroutine) -> None:
     task.add_done_callback(_finish_index_task)
 
 
+async def _complete_or_track_index(coroutine) -> None:
+    """Endpoint-backed jobs finish before returning a download to a managed caller.
+
+    A host may replace an HTTP runtime after a call ends (for example after a
+    worker restart). Do not leave endpoint indexing dependent on that process.
+    Local-model deployments retain the upstream background behavior.
+    """
+    if settings.EMBEDDING_BASE_URL:
+        await coroutine
+    else:
+        _track_index_task(coroutine)
+
+
 async def shutdown_background_tasks() -> None:
     """Wait for owned indexing workers before releasing shared resources."""
     global _index_semaphore
@@ -1740,7 +1753,7 @@ async def handle_download(arguments: Dict[str, Any]) -> List[types.TextContent]:
             )
             _cleanup_versioned_aliases(storage_id)
             # Best-effort index; the tracked task is drained at shutdown.
-            _track_index_task(_run_index_by_id(storage_id))
+            await _complete_or_track_index(_run_index_by_id(storage_id))
             html_payload = {
                 "status": "success",
                 "message": "Paper fetched from arXiv HTML endpoint",
@@ -1805,7 +1818,7 @@ async def handle_download(arguments: Dict[str, Any]) -> List[types.TextContent]:
         _cleanup_versioned_aliases(storage_id)
 
         # Best-effort index; the tracked task is drained at shutdown.
-        _track_index_task(_run_index_from_result(arxiv_result))
+        await _complete_or_track_index(_run_index_from_result(arxiv_result))
 
         pdf_payload = {
             "status": "success",

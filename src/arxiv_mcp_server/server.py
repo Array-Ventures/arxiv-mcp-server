@@ -6,6 +6,7 @@ This module implements an MCP server for interacting with arXiv.
 """
 
 import json
+import hmac
 import logging
 from typing import Any, Dict, List
 
@@ -17,6 +18,8 @@ from mcp.server.stdio import stdio_server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import PlainTextResponse
 from starlette.routing import Mount, Route
 from .config import Settings, close_arxiv_client
@@ -239,13 +242,24 @@ async def _healthz(_request):
     return PlainTextResponse("ok")
 
 
+class BearerGuard(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        if request.url.path.startswith("/mcp") and settings.HTTP_BEARER_TOKEN:
+            actual = request.headers.get("authorization", "").encode()
+            expected = ("Bearer " + settings.HTTP_BEARER_TOKEN).encode()
+            if not hmac.compare_digest(actual, expected):
+                return PlainTextResponse("Unauthorized", status_code=401)
+        return await call_next(request)
+
+
 def _build_http_app(session_manager) -> Starlette:
     """HTTP app: MCP mount plus a deploy probe. stdio does not use this."""
     return Starlette(
+        middleware=[Middleware(BearerGuard)],
         routes=[
             Route("/healthz", _healthz, methods=["GET"]),
             Mount("/mcp", app=session_manager.handle_request),
-        ]
+        ],
     )
 
 

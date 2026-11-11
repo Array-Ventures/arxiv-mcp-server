@@ -145,4 +145,11 @@ async def test_reindex_uses_local_markdown_ids(
 
     payload = json.loads(response[0].text)
     assert payload["status"] == "success"
-    assert set(indexed_ids) == {"2301.00001", "2301.00002"}
+    assert indexed_ids == ["2301.00001"]
+    assert payload["next_start"] == 1
+    response = await semantic_module.handle_reindex(
+        {"clear_existing": False, "start": payload["next_start"]}
+    )
+    payload = json.loads(response[0].text)
+    assert payload["next_start"] is None
+    assert indexed_ids == ["2301.00001", "2301.00002"]

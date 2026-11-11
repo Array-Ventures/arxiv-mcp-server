@@ -520,3 +520,25 @@ Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before openin
 
 Apache License 2.0. See [LICENSE](LICENSE).
 
+
+## OpenAI-compatible embedding endpoints (Array Ventures fork)
+
+Install `arxiv-mcp-server[endpoint]` for endpoint embeddings without Torch or
+Sentence Transformers. Set `EMBEDDING_BASE_URL` (including `/v1`),
+`EMBEDDING_MODEL`, and optionally `EMBEDDING_API_KEY`. Requests use
+`POST <base>/embeddings` with a one-item input array. `EMBEDDING_TIMEOUT`
+defaults to 30 seconds. Endpoint failures never silently fall back to a local model.
+With no endpoint configured, `[pro]` retains the upstream MiniLM behavior.
+
+Set `EMBEDDING_GENERATION` when the serving model changes behind the same URL.
+A changed endpoint, model or generation requires `reindex(clear_existing=true)`;
+old and new vectors are never compared. API key rotation alone does not require
+reindexing. Each storage directory retains its own index. This indexes abstracts,
+not full-paper passages.
+
+Endpoint-backed downloads finish indexing before returning, so changing managed
+HTTP workers cannot interrupt a pending index job. MCP `reindex` is resumable:
+call `{"clear_existing": true, "start": 0}`, then pass `next_start` with
+`clear_existing=false` until `next_start` is null. Each call processes one saved
+paper and runs off the HTTP event loop. This bounds calls for large libraries;
+continuation never clears earlier batches.

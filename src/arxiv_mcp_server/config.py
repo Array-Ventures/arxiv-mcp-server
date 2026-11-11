@@ -128,9 +128,15 @@ class Settings(BaseSettings):
     TRANSPORT: str = "stdio"
     HOST: str = "127.0.0.1"
     PORT: int = 8000
+    HTTP_BEARER_TOKEN: str = ""
     ALLOWED_HOSTS: str = ""
     ALLOWED_ORIGINS: str = ""
     SEMANTIC_SCHOLAR_API_KEY: str = ""
+    EMBEDDING_BASE_URL: str = ""
+    EMBEDDING_MODEL: str = ""
+    EMBEDDING_API_KEY: str = ""
+    EMBEDDING_GENERATION: str = ""
+    EMBEDDING_TIMEOUT: float = 30.0
     model_config = SettingsConfigDict(extra="allow")
 
     def model_post_init(self, __context) -> None:
