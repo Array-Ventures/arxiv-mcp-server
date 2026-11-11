@@ -535,3 +535,10 @@ A changed endpoint, model or generation requires `reindex(clear_existing=true)`;
 old and new vectors are never compared. API key rotation alone does not require
 reindexing. Each storage directory retains its own index. This indexes abstracts,
 not full-paper passages.
+
+Endpoint-backed downloads finish indexing before returning, so changing managed
+HTTP workers cannot interrupt a pending index job. MCP `reindex` is resumable:
+call `{"clear_existing": true, "start": 0}`, then pass `next_start` with
+`clear_existing=false` until `next_start` is null. Each call processes one saved
+paper and runs off the HTTP event loop. This bounds calls for large libraries;
+continuation never clears earlier batches.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import httpx
@@ -49,14 +50,10 @@ semantic_search_tool = types.Tool(
     name="semantic_search",
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
     description=(
-        "Semantic similarity search over papers you have already downloaded locally via download_paper. "
-        "Supports free-text queries (e.g. 'attention mechanisms for long sequences') or finding papers "
-        "similar to a given paper_id. "
-        "IMPORTANT: only searches your local downloaded collection — will return empty results if no papers "
-        "have been downloaded yet. Use search_papers to find papers on arXiv, then download_paper to add "
-        "them to the local index before using this tool. "
-        "Searches saved abstracts, not full-paper passages. Uses a configured embedding endpoint "
-        "with [endpoint] dependencies, or a local model with [pro] dependencies."
+        "Search saved paper abstracts by meaning using query, or find papers similar to paper_id. "
+        "Only downloaded papers are candidates; an empty library returns no results. "
+        "Find papers with search_papers and save them with download_paper first. "
+        "Uses the configured embedding endpoint ([endpoint]) or local embeddings ([pro])."
     ),
     inputSchema={
         "type": "object",
@@ -85,15 +82,21 @@ reindex_tool = types.Tool(
     annotations=ToolAnnotations(
         readOnlyHint=False, destructiveHint=False, openWorldHint=False
     ),
-    description="Rebuild the local semantic index for downloaded papers.",
+    description="Rebuild the local semantic index one saved paper per call. Start with start=0 and clear_existing=true, then call next_start with clear_existing=false until next_start is null.",
     inputSchema={
         "type": "object",
         "properties": {
+            "start": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 0,
+                "description": "Resume at next_start from the previous response.",
+            },
             "clear_existing": {
                 "type": "boolean",
                 "description": "If true, clear the existing index before rebuilding.",
                 "default": True,
-            }
+            },
         },
         "additionalProperties": False,
     },
@@ -103,10 +106,13 @@ reindex_tool = types.Tool(
 def _load_dependencies() -> bool:
     """Load optional ML dependencies only when semantic functionality is used."""
     global np, SentenceTransformer
-    if np is not None and (settings.EMBEDDING_BASE_URL or SentenceTransformer is not None):
+    if np is not None and (
+        settings.EMBEDDING_BASE_URL or SentenceTransformer is not None
+    ):
         return True
     try:
         import numpy as numpy_module
+
         model_class = None
         if not settings.EMBEDDING_BASE_URL:
             from sentence_transformers import SentenceTransformer as model_class
@@ -151,14 +157,39 @@ def _connect() -> sqlite3.Connection:
             updated_at TEXT NOT NULL
         )
         """)
-    conn.execute("CREATE TABLE IF NOT EXISTS embedding_config (id INTEGER PRIMARY KEY CHECK (id = 1), generation TEXT NOT NULL)")
-    generation = hashlib.sha256((settings.EMBEDDING_GENERATION or (settings.EMBEDDING_BASE_URL.rstrip("/") + "\0" + settings.EMBEDDING_MODEL if settings.EMBEDDING_BASE_URL else EMBEDDING_MODEL_NAME)).encode()).hexdigest()
-    prior = conn.execute("SELECT generation FROM embedding_config WHERE id = 1").fetchone()
-    populated = conn.execute("SELECT 1 FROM semantic_index LIMIT 1").fetchone() is not None
-    if populated and ((prior and prior[0] != generation) or (not prior and settings.EMBEDDING_BASE_URL)):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS embedding_config (id INTEGER PRIMARY KEY CHECK (id = 1), generation TEXT NOT NULL)"
+    )
+    generation = hashlib.sha256(
+        (
+            settings.EMBEDDING_GENERATION
+            or (
+                settings.EMBEDDING_BASE_URL.rstrip("/")
+                + "\0"
+                + settings.EMBEDDING_MODEL
+                if settings.EMBEDDING_BASE_URL
+                else EMBEDDING_MODEL_NAME
+            )
+        ).encode()
+    ).hexdigest()
+    prior = conn.execute(
+        "SELECT generation FROM embedding_config WHERE id = 1"
+    ).fetchone()
+    populated = (
+        conn.execute("SELECT 1 FROM semantic_index LIMIT 1").fetchone() is not None
+    )
+    if populated and (
+        (prior and prior[0] != generation)
+        or (not prior and settings.EMBEDDING_BASE_URL)
+    ):
         conn.close()
-        raise ValueError("Embedding configuration changed. Run reindex with clear_existing=true before semantic search.")
-    conn.execute("INSERT INTO embedding_config VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET generation=excluded.generation", (generation,))
+        raise ValueError(
+            "Embedding configuration changed. Run reindex with clear_existing=true before semantic search."
+        )
+    conn.execute(
+        "INSERT INTO embedding_config VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET generation=excluded.generation",
+        (generation,),
+    )
     conn.commit()
     return conn
 
@@ -178,11 +209,23 @@ def _embed_text(text: str) -> Any:
         if not settings.EMBEDDING_MODEL:
             raise ValueError("Configure EMBEDDING_MODEL for endpoint embeddings.")
         try:
-            with httpx.Client(timeout=settings.EMBEDDING_TIMEOUT, follow_redirects=False, trust_env=False) as client:
+            with httpx.Client(
+                timeout=settings.EMBEDDING_TIMEOUT,
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
                 response = client.post(
                     settings.EMBEDDING_BASE_URL.rstrip("/") + "/embeddings",
-                    headers={"Authorization": "Bearer " + settings.EMBEDDING_API_KEY} if settings.EMBEDDING_API_KEY else {},
-                    json={"model": settings.EMBEDDING_MODEL, "input": [text or ""], "encoding_format": "float"},
+                    headers=(
+                        {"Authorization": "Bearer " + settings.EMBEDDING_API_KEY}
+                        if settings.EMBEDDING_API_KEY
+                        else {}
+                    ),
+                    json={
+                        "model": settings.EMBEDDING_MODEL,
+                        "input": [text or ""],
+                        "encoding_format": "float",
+                    },
                 )
                 response.raise_for_status()
                 data = response.json()["data"]
@@ -190,12 +233,20 @@ def _embed_text(text: str) -> Any:
                     raise ValueError("Unexpected embedding response.")
                 vector = np.asarray(data[0]["embedding"], dtype=np.float32)
                 norm = np.linalg.norm(vector)
-                if vector.ndim != 1 or not 0 < len(vector) <= 16000 or not np.isfinite(vector).all() or not np.isfinite(norm) or norm == 0:
+                if (
+                    vector.ndim != 1
+                    or not 0 < len(vector) <= 16000
+                    or not np.isfinite(vector).all()
+                    or not np.isfinite(norm)
+                    or norm == 0
+                ):
                     raise ValueError("Invalid embedding vector.")
                 return vector / norm
         except Exception:
             # Provider URLs, credentials and error bodies must not enter MCP output or logs.
-            raise ValueError("Embedding endpoint failed or returned invalid vectors.") from None
+            raise ValueError(
+                "Embedding endpoint failed or returned invalid vectors."
+            ) from None
     model = _get_model()
     return model.encode(text or "", convert_to_numpy=True, normalize_embeddings=True)
 
@@ -254,7 +305,11 @@ def _upsert_index_record(
 def index_paper_by_id(paper_id: str) -> bool:
     """Fetch arXiv metadata by ID and add/update it in the semantic index."""
     try:
-        client = get_arxiv_client()
+        client = (
+            get_arxiv_client(num_retries=0)
+            if settings.EMBEDDING_BASE_URL
+            else get_arxiv_client()
+        )
         paper = ARXIV_RATE_LIMITER.run_sync(
             lambda: next(client.results(arxiv.Search(id_list=[paper_id])))
         )
@@ -372,7 +427,9 @@ def _get_indexed_paper_vector(paper_id: str) -> Optional[Any]:
     return np.frombuffer(row["embedding"], dtype=np.float32, count=row["embedding_dim"])
 
 
-def rebuild_index(clear_existing: bool = True) -> Dict[str, Any]:
+def rebuild_index(
+    clear_existing: bool = True, start: int = 0, max_papers: int | None = None
+) -> Dict[str, Any]:
     """Rebuild semantic index from downloaded markdown papers."""
     dependency_error = _dependency_error()
     if dependency_error:
@@ -384,6 +441,8 @@ def rebuild_index(clear_existing: bool = True) -> Dict[str, Any]:
         if is_valid_arxiv_id(p.stem)
     )
 
+    if start < 0 or (start and clear_existing):
+        raise ValueError("Continuation requires start >= 0 and clear_existing=false.")
     if clear_existing:
         with sqlite3.connect(_db_path()) as conn:
             # Metadata and vectors are reset together before the new generation is indexed.
@@ -395,7 +454,12 @@ def rebuild_index(clear_existing: bool = True) -> Dict[str, Any]:
     indexed = 0
     failed: List[str] = []
 
-    for paper_id in paper_ids:
+    selected = (
+        paper_ids[start:]
+        if max_papers is None
+        else paper_ids[start : start + max_papers]
+    )
+    for paper_id in selected:
         success = index_paper_by_id(paper_id)
         if success:
             indexed += 1
@@ -407,6 +471,9 @@ def rebuild_index(clear_existing: bool = True) -> Dict[str, Any]:
         "indexed": indexed,
         "failed": failed,
         "total_local_papers": len(paper_ids),
+        "next_start": (
+            start + len(selected) if start + len(selected) < len(paper_ids) else None
+        ),
     }
 
 
@@ -414,7 +481,10 @@ async def handle_reindex(arguments: Dict[str, Any]) -> List[types.TextContent]:
     """Handle reindex tool calls."""
     try:
         clear_existing = bool(arguments.get("clear_existing", True))
-        result = rebuild_index(clear_existing=clear_existing)
+        start = int(arguments.get("start", 0))
+        result = await asyncio.to_thread(
+            rebuild_index, clear_existing=clear_existing, start=start, max_papers=1
+        )
         return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
     except Exception as exc:
         logger.error("Reindex failed: %s", exc)

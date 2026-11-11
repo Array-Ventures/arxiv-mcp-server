@@ -259,7 +259,7 @@ def _build_http_app(session_manager) -> Starlette:
         routes=[
             Route("/healthz", _healthz, methods=["GET"]),
             Mount("/mcp", app=session_manager.handle_request),
-        ]
+        ],
     )
 
 

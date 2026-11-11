@@ -1,4 +1,5 @@
 """Endpoint embeddings use no local model and never mix model generations."""
+
 import json
 import sqlite3
 
@@ -11,10 +12,14 @@ from arxiv_mcp_server.tools import semantic_search as semantic
 
 @pytest.fixture
 def endpoint(monkeypatch, tmp_path):
-    monkeypatch.setattr(semantic.settings, "EMBEDDING_BASE_URL", "http://embedding.test/v1")
+    monkeypatch.setattr(
+        semantic.settings, "EMBEDDING_BASE_URL", "http://embedding.test/v1"
+    )
     monkeypatch.setattr(semantic.settings, "EMBEDDING_MODEL", "test-gemma")
     monkeypatch.setattr(semantic.settings, "EMBEDDING_API_KEY", "fake-secret-canary")
-    monkeypatch.setattr(semantic.settings, "_get_storage_path_from_args", lambda: tmp_path)
+    monkeypatch.setattr(
+        semantic.settings, "_get_storage_path_from_args", lambda: tmp_path
+    )
     monkeypatch.setattr(semantic, "np", np)
     monkeypatch.setattr(semantic, "SentenceTransformer", None)
     return tmp_path
@@ -22,15 +27,24 @@ def endpoint(monkeypatch, tmp_path):
 
 def response(monkeypatch, handler):
     original = httpx.Client
-    monkeypatch.setattr(semantic.httpx, "Client", lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    monkeypatch.setattr(
+        semantic.httpx,
+        "Client",
+        lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs),
+    )
 
 
 def test_endpoint_is_normalized_and_does_not_load_local_model(endpoint, monkeypatch):
     def handle(request):
         assert str(request.url) == "http://embedding.test/v1/embeddings"
         assert request.headers["authorization"] == "Bearer fake-secret-canary"
-        assert json.loads(request.content) == {"model": "test-gemma", "input": ["paper"], "encoding_format": "float"}
+        assert json.loads(request.content) == {
+            "model": "test-gemma",
+            "input": ["paper"],
+            "encoding_format": "float",
+        }
         return httpx.Response(200, json={"data": [{"index": 0, "embedding": [3, 4]}]})
+
     response(monkeypatch, handle)
     assert semantic._load_dependencies()
     assert semantic.SentenceTransformer is None
@@ -39,13 +53,25 @@ def test_endpoint_is_normalized_and_does_not_load_local_model(endpoint, monkeypa
 
 @pytest.mark.parametrize("vector", [[0, 0], [float("nan"), 1], [[1, 2]], []])
 def test_invalid_vectors_fail_without_provider_details(endpoint, monkeypatch, vector):
-    response(monkeypatch, lambda _: httpx.Response(200, content=json.dumps({"data": [{"embedding": vector}]})))
-    with pytest.raises(ValueError, match="^Embedding endpoint failed or returned invalid vectors.$"):
+    response(
+        monkeypatch,
+        lambda _: httpx.Response(
+            200, content=json.dumps({"data": [{"embedding": vector}]})
+        ),
+    )
+    with pytest.raises(
+        ValueError, match="^Embedding endpoint failed or returned invalid vectors.$"
+    ):
         semantic._embed_text("paper")
 
 
 def test_redirect_and_error_bodies_are_not_exposed(endpoint, monkeypatch):
-    response(monkeypatch, lambda _: httpx.Response(307, headers={"Location": "http://private.test"}, text="fake-secret-canary"))
+    response(
+        monkeypatch,
+        lambda _: httpx.Response(
+            307, headers={"Location": "http://private.test"}, text="fake-secret-canary"
+        ),
+    )
     with pytest.raises(ValueError) as error:
         semantic._embed_text("paper")
     assert "canary" not in str(error.value)
@@ -53,7 +79,10 @@ def test_redirect_and_error_bodies_are_not_exposed(endpoint, monkeypatch):
 
 
 def test_configuration_change_requires_explicit_reindex(endpoint, monkeypatch):
-    response(monkeypatch, lambda _: httpx.Response(200, json={"data": [{"embedding": [1, 0]}]}))
+    response(
+        monkeypatch,
+        lambda _: httpx.Response(200, json={"data": [{"embedding": [1, 0]}]}),
+    )
     assert semantic._upsert_index_record("2301.00001", "One", "abstract", [], [])
     monkeypatch.setattr(semantic.settings, "EMBEDDING_API_KEY", "rotated-key")
     assert len(semantic._load_vectors()) == 1
@@ -79,11 +108,43 @@ def test_optional_http_bearer_guards_every_mcp_request(monkeypatch):
     class Manager:
         async def handle_request(self, scope, receive, send):
             from starlette.responses import PlainTextResponse
+
             await PlainTextResponse("ok")(scope, receive, send)
 
     monkeypatch.setattr(server.settings, "HTTP_BEARER_TOKEN", "test-mcp-token")
     with TestClient(server._build_http_app(Manager())) as client:
         for method in ["GET", "POST", "DELETE"]:
-            assert client.request(method, "/mcp/", headers={"Authorization": "Bearer wrong"}).status_code == 401
-            assert client.request(method, "/mcp/", headers={"Authorization": "Bearer test-mcp-token"}).status_code == 200
+            assert (
+                client.request(
+                    method, "/mcp/", headers={"Authorization": "Bearer wrong"}
+                ).status_code
+                == 401
+            )
+            assert (
+                client.request(
+                    method, "/mcp/", headers={"Authorization": "Bearer test-mcp-token"}
+                ).status_code
+                == 200
+            )
         assert client.get("/healthz").status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_endpoint_download_indexing_is_complete_before_caller_can_replace_runtime(
+    monkeypatch,
+):
+    import asyncio
+    from arxiv_mcp_server.tools import download
+
+    monkeypatch.setattr(
+        download.settings, "EMBEDDING_BASE_URL", "http://fake-endpoint.test/v1"
+    )
+    completed = []
+
+    async def slow_index():
+        await asyncio.sleep(0.02)
+        completed.append("indexed")
+
+    await download._complete_or_track_index(slow_index())
+    assert completed == ["indexed"]
+    assert not download._index_tasks
